@@ -1,0 +1,1303 @@
+//+------------------------------------------------------------------+
+//|        Industrial Multi-Asset Trend EA V2                         |
+//| Strategy: EMA Crossover + RSI + ADX + ATR                        |
+//| Timeframe: H1                                                    |
+//| No Martingale / No Grid / No HFT                                 |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "2.00"
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//==================================================================
+// INPUT PARAMETERS
+//==================================================================
+
+//--- Strategy
+input ENUM_TIMEFRAMES InpTimeframe = PERIOD_H1;
+
+input int    InpFastEMA      = 20;
+input int    InpSlowEMA      = 50;
+
+input int    InpRSIPeriod    = 14;
+input double InpRSIBuy       = 55.0;
+input double InpRSISell      = 45.0;
+
+input int    InpADXPeriod    = 14;
+input double InpMinADX       = 20.0;
+
+input int    InpATRPeriod    = 14;
+
+//--- Risk Management
+input double InpRiskPercent  = 1.0;
+
+input double InpSL_ATR       = 2.0;
+input double InpTP_ATR       = 3.0;
+
+//--- Protection
+input double InpDailyLossPct = 2.0;
+input double InpMaxDDPct     = 25.0;
+
+input int    InpCooldownBars = 3;
+
+//--- Spread / Margin
+input double InpMaxSpreadPoints  = 50.0;
+input double InpMarginReservePct = 5.0;
+
+//--- Trading
+input ulong  InpMagicNumber = 20260919;
+
+//==================================================================
+// INDICATOR HANDLES
+//==================================================================
+
+int hFastEMA = INVALID_HANDLE;
+int hSlowEMA = INVALID_HANDLE;
+int hRSI     = INVALID_HANDLE;
+int hADX     = INVALID_HANDLE;
+int hATR     = INVALID_HANDLE;
+
+//==================================================================
+// GLOBAL VARIABLES
+//==================================================================
+
+datetime lastBarTime   = 0;
+datetime lastTradeTime = 0;
+
+double initialEquity  = 0.0;
+double peakEquity     = 0.0;
+double dayStartEquity = 0.0;
+
+int currentDay = -1;
+
+//==================================================================
+// VOLUME DIGITS
+//==================================================================
+
+int VolumeDigits()
+{
+   double step =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_VOLUME_STEP
+      );
+
+   if(step >= 1.0)
+      return 0;
+
+   if(step >= 0.1)
+      return 1;
+
+   if(step >= 0.01)
+      return 2;
+
+   if(step >= 0.001)
+      return 3;
+
+   return 4;
+}
+
+//==================================================================
+// NORMALIZE VOLUME
+//==================================================================
+
+double NormalizeVolumeDown(double volume)
+{
+   double minVolume =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_VOLUME_MIN
+      );
+
+   double maxVolume =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_VOLUME_MAX
+      );
+
+   double step =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_VOLUME_STEP
+      );
+
+   if(
+      minVolume <= 0.0 ||
+      maxVolume <= 0.0 ||
+      step <= 0.0
+   )
+      return 0.0;
+
+   if(volume < minVolume)
+      return 0.0;
+
+   volume =
+      MathMin(
+         volume,
+         maxVolume
+      );
+
+   volume =
+      MathFloor(
+         volume / step
+      ) * step;
+
+   if(volume < minVolume)
+      return 0.0;
+
+   return NormalizeDouble(
+      volume,
+      VolumeDigits()
+   );
+}
+
+//==================================================================
+// INITIALIZATION
+//==================================================================
+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(
+      InpMagicNumber
+   );
+
+   trade.SetTypeFillingBySymbol(
+      _Symbol
+   );
+
+   initialEquity =
+      AccountInfoDouble(
+         ACCOUNT_EQUITY
+      );
+
+   peakEquity =
+      initialEquity;
+
+   dayStartEquity =
+      initialEquity;
+
+   MqlDateTime dt;
+
+   TimeToStruct(
+      TimeCurrent(),
+      dt
+   );
+
+   currentDay =
+      dt.day;
+
+   //--- FAST EMA
+
+   hFastEMA =
+      iMA(
+         _Symbol,
+         InpTimeframe,
+         InpFastEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+   //--- SLOW EMA
+
+   hSlowEMA =
+      iMA(
+         _Symbol,
+         InpTimeframe,
+         InpSlowEMA,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+   //--- RSI
+
+   hRSI =
+      iRSI(
+         _Symbol,
+         InpTimeframe,
+         InpRSIPeriod,
+         PRICE_CLOSE
+      );
+
+   //--- ADX
+
+   hADX =
+      iADX(
+         _Symbol,
+         InpTimeframe,
+         InpADXPeriod
+      );
+
+   //--- ATR
+
+   hATR =
+      iATR(
+         _Symbol,
+         InpTimeframe,
+         InpATRPeriod
+      );
+
+   //--- CHECK INDICATORS
+
+   if(
+      hFastEMA == INVALID_HANDLE ||
+      hSlowEMA == INVALID_HANDLE ||
+      hRSI     == INVALID_HANDLE ||
+      hADX     == INVALID_HANDLE ||
+      hATR     == INVALID_HANDLE
+   )
+   {
+      Print(
+         "ERROR: Failed to create indicator handles."
+      );
+
+      return INIT_FAILED;
+   }
+
+   Print(
+      "Industrial Multi-Asset Trend EA V2 initialized."
+   );
+
+   return INIT_SUCCEEDED;
+}
+
+//==================================================================
+// DEINITIALIZATION
+//==================================================================
+
+void OnDeinit(
+   const int reason
+)
+{
+   if(
+      hFastEMA != INVALID_HANDLE
+   )
+      IndicatorRelease(
+         hFastEMA
+      );
+
+   if(
+      hSlowEMA != INVALID_HANDLE
+   )
+      IndicatorRelease(
+         hSlowEMA
+      );
+
+   if(
+      hRSI != INVALID_HANDLE
+   )
+      IndicatorRelease(
+         hRSI
+      );
+
+   if(
+      hADX != INVALID_HANDLE
+   )
+      IndicatorRelease(
+         hADX
+      );
+
+   if(
+      hATR != INVALID_HANDLE
+   )
+      IndicatorRelease(
+         hATR
+      );
+}
+
+//==================================================================
+// NEW BAR DETECTION
+//==================================================================
+
+bool IsNewBar()
+{
+   datetime currentBarTime =
+      iTime(
+         _Symbol,
+         InpTimeframe,
+         0
+      );
+
+   if(
+      currentBarTime == 0
+   )
+      return false;
+
+   if(
+      currentBarTime != lastBarTime
+   )
+   {
+      lastBarTime =
+         currentBarTime;
+
+      return true;
+   }
+
+   return false;
+}
+
+//==================================================================
+// DAILY RESET
+//==================================================================
+
+void CheckNewDay()
+{
+   MqlDateTime dt;
+
+   TimeToStruct(
+      TimeCurrent(),
+      dt
+   );
+
+   if(
+      dt.day != currentDay
+   )
+   {
+      currentDay =
+         dt.day;
+
+      dayStartEquity =
+         AccountInfoDouble(
+            ACCOUNT_EQUITY
+         );
+
+      Print(
+         "New trading day. Daily equity reset."
+      );
+   }
+}
+
+//==================================================================
+// DAILY LOSS PROTECTION
+//==================================================================
+
+bool DailyLossLimitReached()
+{
+   if(
+      dayStartEquity <= 0.0
+   )
+      return false;
+
+   double equity =
+      AccountInfoDouble(
+         ACCOUNT_EQUITY
+      );
+
+   double lossPct =
+      (
+         (
+            dayStartEquity -
+            equity
+         )
+         /
+         dayStartEquity
+      )
+      * 100.0;
+
+   if(
+      lossPct >= InpDailyLossPct
+   )
+   {
+      Print(
+         "Daily loss protection activated. Loss=",
+         DoubleToString(
+            lossPct,
+            2
+         ),
+         "%"
+      );
+
+      return true;
+   }
+
+   return false;
+}
+
+//==================================================================
+// MAXIMUM DRAWDOWN
+//==================================================================
+
+bool MaximumDrawdownReached()
+{
+   double equity =
+      AccountInfoDouble(
+         ACCOUNT_EQUITY
+      );
+
+   // Update high-water mark
+   if(
+      equity > peakEquity
+   )
+   {
+      peakEquity =
+         equity;
+   }
+
+   if(
+      peakEquity <= 0.0
+   )
+      return false;
+
+   double ddPct =
+      (
+         (
+            peakEquity -
+            equity
+         )
+         /
+         peakEquity
+      )
+      * 100.0;
+
+   if(
+      ddPct >= InpMaxDDPct
+   )
+   {
+      Print(
+         "Maximum drawdown protection activated. DD=",
+         DoubleToString(
+            ddPct,
+            2
+         ),
+         "%"
+      );
+
+      return true;
+   }
+
+   return false;
+}
+
+//==================================================================
+// SPREAD FILTER
+//==================================================================
+
+bool SpreadIsSafe()
+{
+   double ask =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_ASK
+      );
+
+   double bid =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_BID
+      );
+
+   if(
+      ask <= 0.0 ||
+      bid <= 0.0
+   )
+      return false;
+
+   double spreadPoints =
+      (
+         ask -
+         bid
+      )
+      /
+      _Point;
+
+   if(
+      spreadPoints >
+      InpMaxSpreadPoints
+   )
+   {
+      Print(
+         "Spread too high: ",
+         DoubleToString(
+            spreadPoints,
+            1
+         )
+      );
+
+      return false;
+   }
+
+   return true;
+}
+
+//==================================================================
+// POSITION CHECK
+//==================================================================
+
+bool HasOpenPosition()
+{
+   if(
+      !PositionSelect(
+         _Symbol
+      )
+   )
+      return false;
+
+   ulong magic =
+      (
+         ulong
+      )
+      PositionGetInteger(
+         POSITION_MAGIC
+      );
+
+   if(
+      magic != InpMagicNumber
+   )
+      return false;
+
+   return true;
+}
+
+//==================================================================
+// COOLDOWN
+//==================================================================
+
+bool CooldownFinished()
+{
+   if(
+      lastTradeTime == 0
+   )
+      return true;
+
+   int barsPassed =
+      iBarShift(
+         _Symbol,
+         InpTimeframe,
+         lastTradeTime,
+         false
+      );
+
+   if(
+      barsPassed < 0
+   )
+      return true;
+
+   if(
+      barsPassed >=
+      InpCooldownBars
+   )
+      return true;
+
+   return false;
+}
+
+//==================================================================
+// RISK BASED LOT
+//==================================================================
+
+double CalculateRiskLot(
+   double stopDistance
+)
+{
+   if(
+      stopDistance <= 0.0
+   )
+      return 0.0;
+
+   double equity =
+      AccountInfoDouble(
+         ACCOUNT_EQUITY
+      );
+
+   double riskMoney =
+      equity *
+      InpRiskPercent /
+      100.0;
+
+   double tickSize =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_TRADE_TICK_SIZE
+      );
+
+   double tickValue =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_TRADE_TICK_VALUE
+      );
+
+   if(
+      tickSize <= 0.0 ||
+      tickValue <= 0.0
+   )
+      return 0.0;
+
+   double moneyPerLot =
+      (
+         stopDistance /
+         tickSize
+      )
+      *
+      tickValue;
+
+   if(
+      moneyPerLot <= 0.0
+   )
+      return 0.0;
+
+   double volume =
+      riskMoney /
+      moneyPerLot;
+
+   return NormalizeVolumeDown(
+      volume
+   );
+}
+
+//==================================================================
+// MARGIN-AWARE VOLUME
+//==================================================================
+
+double FitVolumeToMargin(
+   ENUM_ORDER_TYPE orderType,
+   double requestedVolume,
+   double price
+)
+{
+   double minVolume =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_VOLUME_MIN
+      );
+
+   double step =
+      SymbolInfoDouble(
+         _Symbol,
+         SYMBOL_VOLUME_STEP
+      );
+
+   if(
+      minVolume <= 0.0 ||
+      step <= 0.0
+   )
+      return 0.0;
+
+   double freeMargin =
+      AccountInfoDouble(
+         ACCOUNT_MARGIN_FREE
+      );
+
+   if(
+      freeMargin <= 0.0
+   )
+      return 0.0;
+
+   double usableMargin =
+      freeMargin *
+      (
+         1.0 -
+         InpMarginReservePct /
+         100.0
+      );
+
+   if(
+      usableMargin <= 0.0
+   )
+      return 0.0;
+
+   double volume =
+      NormalizeVolumeDown(
+         requestedVolume
+      );
+
+   if(
+      volume <= 0.0
+   )
+      return 0.0;
+
+   // Reduce volume until required margin fits.
+   for(
+      int i = 0;
+      i < 10000;
+      i++
+   )
+   {
+      double requiredMargin =
+         0.0;
+
+      ResetLastError();
+
+      if(
+         !OrderCalcMargin(
+            orderType,
+            _Symbol,
+            volume,
+            price,
+            requiredMargin
+         )
+      )
+      {
+         Print(
+            "OrderCalcMargin failed. Error=",
+            GetLastError()
+         );
+
+         return 0.0;
+      }
+
+      if(
+         requiredMargin <=
+         usableMargin
+      )
+      {
+         return NormalizeVolumeDown(
+            volume
+         );
+      }
+
+      volume -= step;
+
+      if(
+         volume < minVolume
+      )
+         break;
+
+      volume =
+         NormalizeVolumeDown(
+            volume
+         );
+
+      if(
+         volume <= 0.0
+      )
+         break;
+   }
+
+   Print(
+      "No feasible volume after margin check."
+   );
+
+   return 0.0;
+}
+
+//==================================================================
+// FINAL TRADE VOLUME
+//==================================================================
+
+double CalculateTradeVolume(
+   ENUM_ORDER_TYPE orderType,
+   double stopDistance,
+   double price
+)
+{
+   double riskLot =
+      CalculateRiskLot(
+         stopDistance
+      );
+
+   if(
+      riskLot <= 0.0
+   )
+      return 0.0;
+
+   return FitVolumeToMargin(
+      orderType,
+      riskLot,
+      price
+   );
+}
+
+//==================================================================
+// GET EMA DATA
+//==================================================================
+
+bool GetEMAData(
+   double &fastCurrent,
+   double &fastPrevious,
+   double &slowCurrent,
+   double &slowPrevious
+)
+{
+   double fastCurrentArray[1];
+   double fastPreviousArray[1];
+
+   double slowCurrentArray[1];
+   double slowPreviousArray[1];
+
+   // Bar 1 = latest completed candle
+   if(
+      CopyBuffer(
+         hFastEMA,
+         0,
+         1,
+         1,
+         fastCurrentArray
+      ) != 1
+   )
+      return false;
+
+   // Bar 2 = previous completed candle
+   if(
+      CopyBuffer(
+         hFastEMA,
+         0,
+         2,
+         1,
+         fastPreviousArray
+      ) != 1
+   )
+      return false;
+
+   if(
+      CopyBuffer(
+         hSlowEMA,
+         0,
+         1,
+         1,
+         slowCurrentArray
+      ) != 1
+   )
+      return false;
+
+   if(
+      CopyBuffer(
+         hSlowEMA,
+         0,
+         2,
+         1,
+         slowPreviousArray
+      ) != 1
+   )
+      return false;
+
+   fastCurrent =
+      fastCurrentArray[0];
+
+   fastPrevious =
+      fastPreviousArray[0];
+
+   slowCurrent =
+      slowCurrentArray[0];
+
+   slowPrevious =
+      slowPreviousArray[0];
+
+   return true;
+}
+
+//==================================================================
+// GET RSI
+//==================================================================
+
+bool GetRSI(
+   double &rsiValue
+)
+{
+   double buffer[1];
+
+   if(
+      CopyBuffer(
+         hRSI,
+         0,
+         1,
+         1,
+         buffer
+      ) != 1
+   )
+      return false;
+
+   rsiValue =
+      buffer[0];
+
+   return true;
+}
+
+//==================================================================
+// GET ADX
+//==================================================================
+
+bool GetADX(
+   double &adxValue
+)
+{
+   double buffer[1];
+
+   if(
+      CopyBuffer(
+         hADX,
+         0,
+         1,
+         1,
+         buffer
+      ) != 1
+   )
+      return false;
+
+   adxValue =
+      buffer[0];
+
+   return true;
+}
+
+//==================================================================
+// GET ATR
+//==================================================================
+
+bool GetATR(
+   double &atrValue
+)
+{
+   double buffer[1];
+
+   if(
+      CopyBuffer(
+         hATR,
+         0,
+         1,
+         1,
+         buffer
+      ) != 1
+   )
+      return false;
+
+   atrValue =
+      buffer[0];
+
+   return true;
+}
+
+//==================================================================
+// TRADE RESULT LOGGING
+//==================================================================
+
+void LogTradeResult(
+   string direction,
+   double volume
+)
+{
+   Print(
+      direction,
+      " request. Lot=",
+      DoubleToString(
+         volume,
+         VolumeDigits()
+      ),
+      " retcode=",
+      trade.ResultRetcode(),
+      " description=",
+      trade.ResultRetcodeDescription()
+   );
+}
+
+//==================================================================
+// MAIN ON TICK
+//==================================================================
+
+void OnTick()
+{
+   //--- Daily reset
+   CheckNewDay();
+
+   //--- Only evaluate once per new H1 candle
+   if(
+      !IsNewBar()
+   )
+      return;
+
+   //--- Daily loss protection
+   if(
+      DailyLossLimitReached()
+   )
+      return;
+
+   //--- Maximum DD protection
+   if(
+      MaximumDrawdownReached()
+   )
+      return;
+
+   //--- Spread protection
+   if(
+      !SpreadIsSafe()
+   )
+      return;
+
+   //--- One position per symbol/magic
+   if(
+      HasOpenPosition()
+   )
+      return;
+
+   //--- Cooldown
+   if(
+      !CooldownFinished()
+   )
+      return;
+
+   //===============================================================
+   // INDICATOR DATA
+   //===============================================================
+
+   double fastCurrent;
+   double fastPrevious;
+
+   double slowCurrent;
+   double slowPrevious;
+
+   double rsiValue;
+   double adxValue;
+   double atrValue;
+
+   if(
+      !GetEMAData(
+         fastCurrent,
+         fastPrevious,
+         slowCurrent,
+         slowPrevious
+      )
+   )
+      return;
+
+   if(
+      !GetRSI(
+         rsiValue
+      )
+   )
+      return;
+
+   if(
+      !GetADX(
+         adxValue
+      )
+   )
+      return;
+
+   if(
+      !GetATR(
+         atrValue
+      )
+   )
+      return;
+
+   if(
+      atrValue <= 0.0
+   )
+      return;
+
+   double closePrice =
+      iClose(
+         _Symbol,
+         InpTimeframe,
+         1
+      );
+
+   if(
+      closePrice <= 0.0
+   )
+      return;
+
+   //===============================================================
+   // V2 EMA CROSSOVER
+   //===============================================================
+
+   bool bullishCross =
+      (
+         fastPrevious <=
+         slowPrevious
+      )
+      &&
+      (
+         fastCurrent >
+         slowCurrent
+      );
+
+   bool bearishCross =
+      (
+         fastPrevious >=
+         slowPrevious
+      )
+      &&
+      (
+         fastCurrent <
+         slowCurrent
+      );
+
+   //===============================================================
+   // BUY SIGNAL
+   //===============================================================
+
+   bool buySignal =
+      bullishCross
+      &&
+      closePrice >
+      slowCurrent
+      &&
+      rsiValue >
+      InpRSIBuy
+      &&
+      adxValue >
+      InpMinADX;
+
+   //===============================================================
+   // SELL SIGNAL
+   //===============================================================
+
+   bool sellSignal =
+      bearishCross
+      &&
+      closePrice <
+      slowCurrent
+      &&
+      rsiValue <
+      InpRSISell
+      &&
+      adxValue >
+      InpMinADX;
+
+   //===============================================================
+   // BUY
+   //===============================================================
+
+   if(
+      buySignal
+   )
+   {
+      double ask =
+         SymbolInfoDouble(
+            _Symbol,
+            SYMBOL_ASK
+         );
+
+      double slDistance =
+         atrValue *
+         InpSL_ATR;
+
+      double tpDistance =
+         atrValue *
+         InpTP_ATR;
+
+      double sl =
+         ask -
+         slDistance;
+
+      double tp =
+         ask +
+         tpDistance;
+
+      double volume =
+         CalculateTradeVolume(
+            ORDER_TYPE_BUY,
+            slDistance,
+            ask
+         );
+
+      if(
+         volume <= 0.0
+      )
+      {
+         Print(
+            "BUY skipped: no valid volume."
+         );
+
+         return;
+      }
+
+      bool sent =
+         trade.Buy(
+            volume,
+            _Symbol,
+            ask,
+            sl,
+            tp,
+            "Industrial EA V2 BUY"
+         );
+
+      LogTradeResult(
+         "BUY",
+         volume
+      );
+
+      if(
+         sent &&
+         trade.ResultRetcode() ==
+         TRADE_RETCODE_DONE
+      )
+      {
+         lastTradeTime =
+            TimeCurrent();
+      }
+
+      return;
+   }
+
+   //===============================================================
+   // SELL
+   //===============================================================
+
+   if(
+      sellSignal
+   )
+   {
+      double bid =
+         SymbolInfoDouble(
+            _Symbol,
+            SYMBOL_BID
+         );
+
+      double slDistance =
+         atrValue *
+         InpSL_ATR;
+
+      double tpDistance =
+         atrValue *
+         InpTP_ATR;
+
+      double sl =
+         bid +
+         slDistance;
+
+      double tp =
+         bid -
+         tpDistance;
+
+      double volume =
+         CalculateTradeVolume(
+            ORDER_TYPE_SELL,
+            slDistance,
+            bid
+         );
+
+      if(
+         volume <= 0.0
+      )
+      {
+         Print(
+            "SELL skipped: no valid volume."
+         );
+
+         return;
+      }
+
+      bool sent =
+         trade.Sell(
+            volume,
+            _Symbol,
+            bid,
+            sl,
+            tp,
+            "Industrial EA V2 SELL"
+         );
+
+      LogTradeResult(
+         "SELL",
+         volume
+      );
+
+      if(
+         sent &&
+         trade.ResultRetcode() ==
+         TRADE_RETCODE_DONE
+      )
+      {
+         lastTradeTime =
+            TimeCurrent();
+      }
+
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
